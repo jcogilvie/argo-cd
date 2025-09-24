@@ -1089,50 +1089,40 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 
 	// Pre-allocate missing refs slice with estimated capacity to reduce allocations
 	missingRefs := make([]missingOwnerRef, 0, len(keys)) // Estimate: max one missing ref per key
-	
+
+	// Create a shared visited map to prevent duplicate visits across all namespaces
+	visited := make(map[kube.ResourceKey]int, len(keys))
+
 	// Process regular namespaces first (not cluster-scoped)
 	for namespace, namespaceKeys := range keysPerNamespace {
 		if namespace == "" {
 			continue // Skip cluster-scoped namespace for now
 		}
 		nsNodes := c.nsIndex[namespace]
-		
+
 		// For regular namespaces, collect missing owner references during graph building
 		// Reuse the same slice to minimize allocations
-		graph := buildGraph(nsNodes, nil, &missingRefs)
-		
-		c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, action)
+		graph := buildGraph(nsNodes, &missingRefs, false)
+
+		c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, visited, action)
 	}
 
 	// Process cluster-scoped namespace last and resolve all missing owner references
 	if clusterKeys, exists := keysPerNamespace[""]; exists {
 		nsNodes := c.nsIndex[""]
-		
-		// Batch resolve all collected missing owner references in a single pass
-		if !c.disableClusterScopedParentRefs && len(missingRefs) > 0 {
-			// Optimized batch resolution - only iterate if we have refs to resolve
-			for i := range missingRefs {
-				missing := &missingRefs[i] // Use pointer to avoid copying struct
-				if parent, exists := nsNodes[missing.parentKey]; exists {
-					missing.childResource.OwnerRefs[missing.ownerRefIndex].UID = parent.Ref.UID
-				}
-			}
-		}
-		
-		// Use full cluster-scoped parent capabilities for cluster namespace
-		var allResources map[kube.ResourceKey]*Resource
+
+		// Build graph and resolve cross-namespace relationships
+		var refsToResolve *[]missingOwnerRef
 		if !c.disableClusterScopedParentRefs {
-			allResources = c.resources
+			refsToResolve = &missingRefs
 		}
-		graph := buildGraph(nsNodes, allResources, nil)
-		
-		c.processNamespaceHierarchy(clusterKeys, nsNodes, graph, action)
+		graph := buildGraph(nsNodes, refsToResolve, true)
+		c.processNamespaceHierarchy(clusterKeys, nsNodes, graph, visited, action)
 	}
 }
 
 // processNamespaceHierarchy handles the hierarchy traversal for a single namespace
-func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKey, nsNodes map[kube.ResourceKey]*Resource, graph map[kube.ResourceKey]map[types.UID]*Resource, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
-	visited := make(map[kube.ResourceKey]int, len(namespaceKeys))
+func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKey, nsNodes map[kube.ResourceKey]*Resource, graph map[kube.ResourceKey]map[types.UID]*Resource, visited map[kube.ResourceKey]int, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
 	for _, key := range namespaceKeys {
 		// The check for existence of key is done above.
 		res := c.resources[key]
@@ -1158,35 +1148,51 @@ func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKe
 }
 
 // buildGraph builds a resource graph from the given nodes
-// When missingRefs is provided (non-nil), it collects missing owner references for batch resolution
-// When allResources is provided (non-nil), it resolves cluster-scoped parent references immediately
-func buildGraph(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef) map[kube.ResourceKey]map[types.UID]*Resource {
+// When processingClusterNamespace is false, we're processing regular namespaces and will collect
+// missing owner references that need cluster-scoped parent resolution.
+// When processingClusterNamespace is true, we're processing the cluster-scoped namespace and will
+// resolve those previously collected references and build cross-namespace relationships.
+func buildGraph(nsNodes map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef, processingClusterNamespace bool) map[kube.ResourceKey]map[types.UID]*Resource {
 	// Prepare to construct a graph
 	nodesByUID := make(map[types.UID][]*Resource, len(nsNodes))
-
-	// More efficient: check if we're processing cluster scope by presence of allResources and absence of missingRefs
-	// This avoids checking every node's namespace
-	processingClusterScope := allResources != nil && missingRefs == nil
 
 	for _, node := range nsNodes {
 		nodesByUID[node.Ref.UID] = append(nodesByUID[node.Ref.UID], node)
 	}
 
-	// Build UID index for allResources if needed to avoid O(n) lookups later
-	var allResourcesByUID map[types.UID]*Resource
-	if allResources != nil {
-		allResourcesByUID = make(map[types.UID]*Resource, len(allResources))
-		for _, res := range allResources {
-			allResourcesByUID[res.Ref.UID] = res
+	// Build index of missing refs by parent key for efficient lookup when processing cluster-scoped namespace
+	var missingRefsByParent map[kube.ResourceKey][]missingOwnerRef
+	if processingClusterNamespace && missingRefs != nil && len(*missingRefs) > 0 {
+		missingRefsByParent = make(map[kube.ResourceKey][]missingOwnerRef)
+		for _, ref := range *missingRefs {
+			missingRefsByParent[ref.parentKey] = append(missingRefsByParent[ref.parentKey], ref)
 		}
 	}
+
 
 	// In graph, the key is the parent and the value is a list of children.
 	// Pre-size to avoid rehashing during insertion
 	graph := make(map[kube.ResourceKey]map[types.UID]*Resource, len(nsNodes)/4)
 
-	// Loop through all nodes, calling each one "childNode," because we're only bothering with it if it has a parent.
+	// Process all nodes in the current namespace
 	for _, childNode := range nsNodes {
+		// If we're processing cluster-scoped namespace, check if this node has orphaned children
+		if processingClusterNamespace && missingRefsByParent != nil {
+			if orphanedChildren, exists := missingRefsByParent[childNode.ResourceKey()]; exists {
+				// This cluster-scoped resource has orphaned children - add them to the graph
+				for _, orphan := range orphanedChildren {
+					// Update the child's owner reference with the parent's UID
+					orphan.childResource.OwnerRefs[orphan.ownerRefIndex].UID = childNode.Ref.UID
+
+					// Add the cross-namespace relationship to the graph
+					if _, ok := graph[childNode.ResourceKey()]; !ok {
+						graph[childNode.ResourceKey()] = make(map[types.UID]*Resource)
+					}
+					graph[childNode.ResourceKey()][orphan.childResource.Ref.UID] = orphan.childResource
+				}
+			}
+		}
+
 		for i, ownerRef := range childNode.OwnerRefs {
 			// First, backfill UID of inferred owner child references.
 			if ownerRef.UID == "" {
@@ -1203,17 +1209,14 @@ func buildGraph(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.Re
 					// Parent not found in same namespace
 					clusterScopedKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: "", Name: ownerRef.Name}
 
-					if missingRefs != nil {
-						// Collect missing reference for batch resolution
+					if missingRefs != nil && !processingClusterNamespace {
+						// We're in a regular namespace - collect missing reference for later resolution
 						*missingRefs = append(*missingRefs, missingOwnerRef{
 							childResource: childNode,
 							ownerRefIndex: i,
 							parentKey:     clusterScopedKey,
 						})
 						continue
-					} else if allResources != nil {
-						// Try cluster-scoped lookup immediately
-						graphKeyNode, ok = allResources[clusterScopedKey]
 					}
 				}
 
@@ -1227,14 +1230,6 @@ func buildGraph(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.Re
 
 			// Now that we have the UID of the parent, update the graph.
 			uidNodes, ok := nodesByUID[ownerRef.UID]
-			if !ok && allResourcesByUID != nil {
-				// If parent not found in current namespace, check if it exists in allResources
-				// Use the pre-built index for O(1) lookup instead of O(n) iteration
-				if parentCandidate, exists := allResourcesByUID[ownerRef.UID]; exists {
-					uidNodes = []*Resource{parentCandidate}
-					ok = true
-				}
-			}
 
 			if ok {
 				for _, uidNode := range uidNodes {
@@ -1254,33 +1249,6 @@ func buildGraph(nsNodes map[kube.ResourceKey]*Resource, allResources map[kube.Re
 							graph[uidNode.ResourceKey()][childNode.Ref.UID] = childNode
 						}
 					}
-				}
-			}
-		}
-	}
-
-	// Second pass: process namespaced children of cluster-scoped parents if allResources is provided
-	// Skip this pass when processing regular namespaces (only needed when processing cluster-scoped resources)
-	if allResources != nil && processingClusterScope {
-		for _, childNode := range allResources {
-			// Skip if already processed in the current namespace
-			if _, exists := nsNodes[childNode.ResourceKey()]; exists {
-				continue
-			}
-
-			// Check if this child has a cluster-scoped parent that we're currently processing
-			for _, ownerRef := range childNode.OwnerRefs {
-				group, err := schema.ParseGroupVersion(ownerRef.APIVersion)
-				if err != nil {
-					continue
-				}
-				parentKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: "", Name: ownerRef.Name}
-				if parentNode, exists := nsNodes[parentKey]; exists {
-					// Found a cluster-scoped parent → namespaced child relationship
-					if _, ok := graph[parentNode.ResourceKey()]; !ok {
-						graph[parentNode.ResourceKey()] = make(map[types.UID]*Resource)
-					}
-					graph[parentNode.ResourceKey()][childNode.Ref.UID] = childNode
 				}
 			}
 		}

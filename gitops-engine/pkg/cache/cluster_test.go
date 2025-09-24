@@ -1230,8 +1230,13 @@ func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
 	require.NoError(t, err)
 
 	keys := []kube.ResourceKey{}
+	// In production, if you want to iterate a cluster-scoped resource and its namespaced children,
+	// you would include both in the keys (e.g., as part of managed resources)
 	cluster.IterateHierarchyV2(
-		[]kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))},
+		[]kube.ResourceKey{
+			kube.GetResourceKey(mustToUnstructured(testClusterParent())),
+			kube.GetResourceKey(mustToUnstructured(testNamespacedChild())),
+		},
 		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
 			keys = append(keys, resource.ResourceKey())
 			return true
@@ -1385,7 +1390,7 @@ func BenchmarkBuildGraph(b *testing.B) {
 	testResources := buildTestResourceMap()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		buildGraph(testResources, nil, nil)
+		buildGraph(testResources, nil, false)
 	}
 }
 
@@ -1475,46 +1480,6 @@ subjects:
 	return resources
 }
 
-func BenchmarkBuildGraphCrossNamespace(b *testing.B) {
-	testResources := buildCrossNamespaceTestResourceMap()
-	// Separate resources by namespace like the real code does
-	clusterResources := make(map[kube.ResourceKey]*Resource)
-	namespacedResourcesByNS := make(map[string]map[kube.ResourceKey]*Resource)
-
-	for key, resource := range testResources {
-		if key.Namespace == "" {
-			clusterResources[key] = resource
-		} else {
-			if namespacedResourcesByNS[key.Namespace] == nil {
-				namespacedResourcesByNS[key.Namespace] = make(map[kube.ResourceKey]*Resource)
-			}
-			namespacedResourcesByNS[key.Namespace][key] = resource
-		}
-	}
-
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		// Simulate the actual cross-namespace processing algorithm
-		missingRefs := make([]missingOwnerRef, 0, 100) // Pre-allocate with reasonable capacity
-
-		// Phase 1: Process namespaced resources and collect missing owner references
-		for _, nsResources := range namespacedResourcesByNS {
-			buildGraph(nsResources, nil, &missingRefs)
-		}
-
-		// Phase 2: Batch resolve missing references
-		for i := range missingRefs {
-			missing := &missingRefs[i]
-			if parent, exists := clusterResources[missing.parentKey]; exists {
-				missing.childResource.OwnerRefs[missing.ownerRefIndex].UID = parent.Ref.UID
-			}
-		}
-
-		// Phase 3: Process cluster-scoped resources with full cross-namespace capabilities
-		buildGraph(clusterResources, testResources, nil)
-	}
-}
-
 func BenchmarkIterateHierarchyV2CrossNamespace(b *testing.B) {
 	cluster := newCluster(b).WithAPIResources([]kube.APIResourceInfo{{
 		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
@@ -1552,4 +1517,77 @@ func BenchmarkIterateHierarchyV2CrossNamespace(b *testing.B) {
 			return true
 		})
 	}
+}
+
+func TestIterateHierarchyV2_NoDuplicatesInSameNamespace(t *testing.T) {
+	// Create a parent-child relationship in the same namespace
+	parent := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "parent", Namespace: "default", UID: "parent-uid",
+		},
+	}
+	child := &appsv1.ReplicaSet{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "ReplicaSet"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "child", Namespace: "default", UID: "child-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "Deployment", Name: "parent", UID: "parent-uid",
+			}},
+		},
+	}
+
+	cluster := newCluster(t, parent, child)
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	visitCount := make(map[string]int)
+	cluster.IterateHierarchyV2(
+		[]kube.ResourceKey{
+			kube.GetResourceKey(mustToUnstructured(parent)),
+			kube.GetResourceKey(mustToUnstructured(child)),
+		},
+		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			visitCount[resource.Ref.Name]++
+			return true
+		},
+	)
+
+	// Each resource should be visited exactly once
+	assert.Equal(t, 1, visitCount["parent"], "parent should be visited once")
+	assert.Equal(t, 1, visitCount["child"], "child should be visited once")
+}
+
+func TestIterateHierarchyV2_NoDuplicatesCrossNamespace(t *testing.T) {
+	// Test that cross-namespace parent-child relationships don't cause duplicates
+	visitCount := make(map[string]int)
+	
+	cluster := newCluster(t, testClusterParent(), testNamespacedChild(), testClusterChild()).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "Namespace"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}, {
+		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}})
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	cluster.IterateHierarchyV2(
+		[]kube.ResourceKey{
+			kube.GetResourceKey(mustToUnstructured(testClusterParent())),
+			kube.GetResourceKey(mustToUnstructured(testNamespacedChild())),
+			kube.GetResourceKey(mustToUnstructured(testClusterChild())),
+		},
+		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			visitCount[resource.Ref.Name]++
+			return true
+		},
+	)
+
+	// Each resource should be visited exactly once, even with cross-namespace relationships
+	assert.Equal(t, 1, visitCount["test-cluster-parent"], "cluster parent should be visited once")
+	assert.Equal(t, 1, visitCount["namespaced-child"], "namespaced child should be visited once")
+	assert.Equal(t, 1, visitCount["cluster-child"], "cluster child should be visited once")
 }
