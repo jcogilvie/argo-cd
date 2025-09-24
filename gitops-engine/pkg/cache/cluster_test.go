@@ -1404,3 +1404,152 @@ func BenchmarkIterateHierarchyV2(b *testing.B) {
 		})
 	}
 }
+
+func buildCrossNamespaceTestResourceMap() map[kube.ResourceKey]*Resource {
+	resources := make(map[kube.ResourceKey]*Resource)
+
+	// Create cluster-scoped parents (ClusterRoles)
+	for i := 0; i < 1000; i++ {
+		clusterRoleName := fmt.Sprintf("cluster-role-%d", i)
+		uid := uuid.New().String()
+		key := kube.ResourceKey{
+			Group:     "rbac.authorization.k8s.io",
+			Kind:      "ClusterRole",
+			Namespace: "", // cluster-scoped
+			Name:      clusterRoleName,
+		}
+
+		resourceYaml := fmt.Sprintf(`
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: %s
+  uid: %s
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]`, clusterRoleName, uid)
+
+		resources[key] = cacheTest.newResource(strToUnstructured(resourceYaml))
+	}
+
+	// Create namespaced children (ClusterRoleBindings) that reference cluster-scoped parents
+	namespaces := []string{"namespace-1", "namespace-2", "namespace-3", "namespace-4", "namespace-5"}
+	for i := 0; i < 5000; i++ {
+		bindingName := fmt.Sprintf("binding-%d", i)
+		namespace := namespaces[i%len(namespaces)]
+		clusterRoleIndex := i % 1000 // Reference one of the 1000 cluster roles
+		clusterRoleName := fmt.Sprintf("cluster-role-%d", clusterRoleIndex)
+		uid := uuid.New().String()
+
+		key := kube.ResourceKey{
+			Group:     "rbac.authorization.k8s.io",
+			Kind:      "ClusterRoleBinding",
+			Namespace: namespace,
+			Name:      bindingName,
+		}
+
+		resourceYaml := fmt.Sprintf(`
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: %s
+  namespace: %s
+  uid: %s
+  ownerReferences:
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    name: %s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: %s
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: %s`, bindingName, namespace, uid, clusterRoleName, clusterRoleName, namespace)
+
+		resources[key] = cacheTest.newResource(strToUnstructured(resourceYaml))
+	}
+
+	return resources
+}
+
+func BenchmarkBuildGraphCrossNamespace(b *testing.B) {
+	testResources := buildCrossNamespaceTestResourceMap()
+	// Separate resources by namespace like the real code does
+	clusterResources := make(map[kube.ResourceKey]*Resource)
+	namespacedResourcesByNS := make(map[string]map[kube.ResourceKey]*Resource)
+
+	for key, resource := range testResources {
+		if key.Namespace == "" {
+			clusterResources[key] = resource
+		} else {
+			if namespacedResourcesByNS[key.Namespace] == nil {
+				namespacedResourcesByNS[key.Namespace] = make(map[kube.ResourceKey]*Resource)
+			}
+			namespacedResourcesByNS[key.Namespace][key] = resource
+		}
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		// Simulate the actual cross-namespace processing algorithm
+		missingRefs := make([]missingOwnerRef, 0, 100) // Pre-allocate with reasonable capacity
+
+		// Phase 1: Process namespaced resources and collect missing owner references
+		for _, nsResources := range namespacedResourcesByNS {
+			buildGraph(nsResources, nil, &missingRefs)
+		}
+
+		// Phase 2: Batch resolve missing references
+		for i := range missingRefs {
+			missing := &missingRefs[i]
+			if parent, exists := clusterResources[missing.parentKey]; exists {
+				missing.childResource.OwnerRefs[missing.ownerRefIndex].UID = parent.Ref.UID
+			}
+		}
+
+		// Phase 3: Process cluster-scoped resources with full cross-namespace capabilities
+		buildGraph(clusterResources, testResources, nil)
+	}
+}
+
+func BenchmarkIterateHierarchyV2CrossNamespace(b *testing.B) {
+	cluster := newCluster(b).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}, {
+		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRoleBinding"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
+		Meta:                 metav1.APIResource{Namespaced: true},
+	}})
+
+	testResources := buildCrossNamespaceTestResourceMap()
+	for _, resource := range testResources {
+		cluster.setNode(resource)
+	}
+
+	// Build list of all namespaced children that have cluster-scoped parents
+	// This forces the benchmark to exercise cross-namespace traversal
+	var namespacedChildKeys []kube.ResourceKey
+	for key, resource := range testResources {
+		if key.Namespace != "" { // namespaced resource
+			for _, ownerRef := range resource.OwnerRefs {
+				if ownerRef.Kind == "ClusterRole" {
+					namespacedChildKeys = append(namespacedChildKeys, key)
+					break
+				}
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		// Start from namespaced children - this will trigger cross-namespace parent lookup
+		cluster.IterateHierarchyV2(namespacedChildKeys, func(_ *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			return true
+		})
+	}
+}
