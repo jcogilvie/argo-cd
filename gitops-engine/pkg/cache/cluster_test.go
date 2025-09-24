@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -91,11 +92,11 @@ func newClusterWithOptions(_ testing.TB, opts []UpdateSettingsFunc, objs ...runt
 	client.PrependReactor("list", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
 		handled, ret, err = reactor.React(action)
 		if err != nil || !handled {
-			return
+			return handled, ret, fmt.Errorf("reactor failed: %w", err)
 		}
 		// make sure list response have resource version
 		ret.(metav1.ListInterface).SetResourceVersion("123")
-		return
+		return handled, ret, nil
 	})
 
 	apiResources := []kube.APIResourceInfo{{
@@ -302,12 +303,16 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 				tc.cluster.lock.Lock()
 				defer tc.cluster.lock.Unlock()
 
-				refs := tc.cluster.resources[kube.GetResourceKey(pvc)].OwnerRefs
+				resource := tc.cluster.resources[kube.GetResourceKey(pvc)]
+				if resource == nil {
+					return false // Resource not ready yet, keep retrying
+				}
+				refs := resource.OwnerRefs
 				if tc.expectNoOwner {
 					return len(refs) == 0
 				}
 				return assert.ElementsMatch(t, refs, tc.expectedRefs)
-			}, 5*time.Second, 10*time.Millisecond, "Expected PVC to have correct owner reference")
+			}, 5*time.Second, 20*time.Millisecond, "Expected PVC to have correct owner reference")
 		})
 	}
 }
@@ -1157,6 +1162,113 @@ func TestIterateHierachyV2(t *testing.T) {
 	})
 }
 
+func testClusterParent() *corev1.Namespace {
+	return &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Namespace",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-cluster-parent",
+			UID:             "cluster-parent-123",
+			ResourceVersion: "123",
+		},
+	}
+}
+
+func testNamespacedChild() *corev1.Pod {
+	return &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "namespaced-child",
+			Namespace:       "test-namespace",
+			UID:             "namespaced-child-456",
+			ResourceVersion: "123",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Namespace",
+				Name:       "test-cluster-parent",
+			}},
+		},
+	}
+}
+
+func testClusterChild() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "ClusterRole",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "cluster-child",
+			UID:             "cluster-child-789",
+			ResourceVersion: "123",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Namespace",
+				Name:       "test-cluster-parent",
+				UID:        "cluster-parent-123",
+			}},
+		},
+	}
+}
+
+func TestIterateHierarchyV2_ClusterScopedParents(t *testing.T) {
+	cluster := newCluster(t, testClusterParent(), testNamespacedChild(), testClusterChild()).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "Namespace"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}, {
+		GroupKind:            schema.GroupKind{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}})
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	keys := []kube.ResourceKey{}
+	cluster.IterateHierarchyV2(
+		[]kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))},
+		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, resource.ResourceKey())
+			return true
+		},
+	)
+
+	assert.ElementsMatch(t, []kube.ResourceKey{
+		kube.GetResourceKey(mustToUnstructured(testClusterParent())),
+		kube.GetResourceKey(mustToUnstructured(testNamespacedChild())),
+		kube.GetResourceKey(mustToUnstructured(testClusterChild())),
+	}, keys)
+}
+
+func TestIterateHierarchyV2_DisabledClusterScopedParents(t *testing.T) {
+	t.Setenv("GITOPS_ENGINE_DISABLE_CLUSTER_SCOPED_PARENT_REFS", "1")
+
+	cluster := newCluster(t, testClusterParent(), testNamespacedChild()).WithAPIResources([]kube.APIResourceInfo{{
+		GroupKind:            schema.GroupKind{Group: "", Kind: "Namespace"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}})
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	keys := []kube.ResourceKey{}
+	cluster.IterateHierarchyV2(
+		[]kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))},
+		func(resource *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, resource.ResourceKey())
+			return true
+		},
+	)
+
+	// When disabled, should only visit the parent
+	assert.Equal(t, []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testClusterParent()))}, keys)
+}
+
 // Test_watchEvents_Deadlock validates that starting watches will not create a deadlock
 // caused by using improper locking in various callback methods when there is a high load on the
 // system.
@@ -1273,7 +1385,7 @@ func BenchmarkBuildGraph(b *testing.B) {
 	testResources := buildTestResourceMap()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		buildGraph(testResources)
+		buildGraph(testResources, nil, nil)
 	}
 }
 
