@@ -1078,20 +1078,24 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
+
+	// Build namespace map with resource validation
 	keysPerNamespace := make(map[string][]kube.ResourceKey)
+	hasClusterNamespace := false
 	for _, key := range keys {
 		if _, ok := c.resources[key]; ok {
 			keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
+			if key.Namespace == "" {
+				hasClusterNamespace = true
+			}
 		}
 	}
 
-	// Fast path: feature disabled or no cluster resources or no keys involve cluster namespace
-	_, hasClusterNamespace := keysPerNamespace[""]
+	// Fast path: feature disabled, no cluster resources, or no keys involve cluster namespace
 	if c.disableClusterScopedParentRefs || len(c.nsIndex[""]) == 0 || !hasClusterNamespace {
 		// Process all namespaces with simple graph building (no cross-namespace overhead)
 		for namespace, namespaceKeys := range keysPerNamespace {
 			nsNodes := c.nsIndex[namespace]
-			// Use buildGraph for best performance in fast path
 			graph := buildGraph(nsNodes)
 			// Use per-namespace visited map for better cache locality
 			visited := make(map[kube.ResourceKey]int, len(namespaceKeys))
