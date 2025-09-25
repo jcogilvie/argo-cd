@@ -1080,90 +1080,58 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 	defer c.lock.RUnlock()
 	keysPerNamespace := make(map[string][]kube.ResourceKey)
 	for _, key := range keys {
-		_, ok := c.resources[key]
-		if !ok {
-			continue
+		if _, ok := c.resources[key]; ok {
+			keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
 		}
-		keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
 	}
 
-	// Fast path when cross-namespace feature is disabled
-	if c.disableClusterScopedParentRefs {
+	// Fast path: feature disabled or no cluster resources or no keys involve cluster namespace
+	_, hasClusterNamespace := keysPerNamespace[""]
+	if c.disableClusterScopedParentRefs || len(c.nsIndex[""]) == 0 || !hasClusterNamespace {
 		// Process all namespaces with simple graph building (no cross-namespace overhead)
 		for namespace, namespaceKeys := range keysPerNamespace {
 			nsNodes := c.nsIndex[namespace]
-			graph := buildGraph(nsNodes, nil, false)
-			// Use per-namespace visited map for better performance
+			// Use buildGraphSimple for best performance in fast path
+			graph := buildGraphSimple(nsNodes)
+			// Use per-namespace visited map for better cache locality
 			visited := make(map[kube.ResourceKey]int, len(namespaceKeys))
 			c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, visited, action)
 		}
 		return
 	}
 
-	// Slower path: handle potential cross-namespace references
-	// Check if we actually need to handle cross-namespace refs
-	_, hasClusterNamespace := keysPerNamespace[""]
-	clusterNamespaceEmpty := len(c.nsIndex[""]) == 0
-	
-	// If there's no cluster namespace or it's empty, use fast path for all namespaces
-	if !hasClusterNamespace || clusterNamespaceEmpty {
-		for namespace, namespaceKeys := range keysPerNamespace {
-			nsNodes := c.nsIndex[namespace]
-			graph := buildGraph(nsNodes, nil, false)
-			// Use per-namespace visited map for better performance
-			visited := make(map[kube.ResourceKey]int, len(namespaceKeys))
-			c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, visited, action)
-		}
-		return
+	// Slow path: cross-namespace refs enabled, cluster resources exist, and we're processing cluster keys
+	clusterNodes := c.nsIndex[""]
+	clusterNodesByUID := make(map[types.UID][]*Resource, len(clusterNodes))
+	for _, node := range clusterNodes {
+		clusterNodesByUID[node.Ref.UID] = append(clusterNodesByUID[node.Ref.UID], node)
 	}
 
-	// Pre-allocate missing refs slice with estimated capacity to reduce allocations
-	missingRefs := make([]missingOwnerRef, 0, len(keys)) // Estimate: max one missing ref per key
-	
-	// Track cross-namespace children that have been visited to prevent duplicates
-	// This is a small map containing only resources with cluster-scoped parents
-	crossNamespaceVisited := make(map[kube.ResourceKey]bool)
+	// Slow path: cross-namespace refs enabled and detected
+	// clusterNodesByUID already built above for detection
 
-	// Process regular namespaces first (not cluster-scoped)
+	// Process namespaces that might have cross-namespace references
+	// Use a shared visited map to prevent duplicate visits across namespaces
+	visited := make(map[kube.ResourceKey]int, len(keys))
 	for namespace, namespaceKeys := range keysPerNamespace {
-		if namespace == "" {
-			continue // Skip cluster-scoped namespace for now
-		}
 		nsNodes := c.nsIndex[namespace]
-
-		// For regular namespaces, collect missing owner references during graph building
-		// Reuse the same slice to minimize allocations
-		graph := buildGraph(nsNodes, &missingRefs, false)
-
-		// Use per-namespace visited map for better performance
-		visited := make(map[kube.ResourceKey]int, len(namespaceKeys))
-		
-		// Process the namespace and track any cross-namespace children we visit
-		c.processNamespaceHierarchyWithTracking(namespaceKeys, nsNodes, graph, visited, action, &missingRefs, crossNamespaceVisited)
-	}
-
-	// Process cluster-scoped namespace last and resolve all missing owner references
-	if clusterKeys, exists := keysPerNamespace[""]; exists {
-		nsNodes := c.nsIndex[""]
-
-		// Build graph and resolve cross-namespace relationships
-		// Use per-namespace visited map for cluster-scoped resources
-		visited := make(map[kube.ResourceKey]int, len(clusterKeys))
-		if len(missingRefs) == 0 {
-			graph := buildGraph(nsNodes, nil, false)
-			c.processNamespaceHierarchy(clusterKeys, nsNodes, graph, visited, action)
-		} else {
-			graph := buildGraph(nsNodes, &missingRefs, true)
-			// Process with awareness of already-visited cross-namespace children
-			c.processClusterNamespaceWithCrossRefs(clusterKeys, nsNodes, graph, visited, action, crossNamespaceVisited)
-		}
+		graph := buildGraphWithCrossNamespace(nsNodes, clusterNodesByUID)
+		c.processNamespaceHierarchy(namespaceKeys, nsNodes, graph, visited, action)
 	}
 }
 
-// processNamespaceHierarchy handles the hierarchy traversal for a single namespace
-func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKey, nsNodes map[kube.ResourceKey]*Resource, graph map[kube.ResourceKey]map[types.UID]*Resource, visited map[kube.ResourceKey]int, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
+// processNamespaceHierarchy processes hierarchy for keys within a single namespace
+func (c *clusterCache) processNamespaceHierarchy(
+	namespaceKeys []kube.ResourceKey,
+	nsNodes map[kube.ResourceKey]*Resource,
+	graph map[kube.ResourceKey]map[types.UID]*Resource,
+	visited map[kube.ResourceKey]int,
+	action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool,
+) {
 	for _, key := range namespaceKeys {
-		// The check for existence of key is done above.
+		visited[key] = 0
+	}
+	for _, key := range namespaceKeys {
 		res := c.resources[key]
 		if visited[key] == 2 || !action(res, nsNodes) {
 			continue
@@ -1186,143 +1154,33 @@ func (c *clusterCache) processNamespaceHierarchy(namespaceKeys []kube.ResourceKe
 	}
 }
 
-// processNamespaceHierarchyWithTracking is like processNamespaceHierarchy but tracks cross-namespace children
-func (c *clusterCache) processNamespaceHierarchyWithTracking(namespaceKeys []kube.ResourceKey, nsNodes map[kube.ResourceKey]*Resource, graph map[kube.ResourceKey]map[types.UID]*Resource, visited map[kube.ResourceKey]int, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool, missingRefs *[]missingOwnerRef, crossNamespaceVisited map[kube.ResourceKey]bool) {
-	// Build a set of resources that have cross-namespace parents for quick lookup
-	crossNamespaceChildren := make(map[kube.ResourceKey]bool)
-	if missingRefs != nil {
-		for _, ref := range *missingRefs {
-			crossNamespaceChildren[ref.childResource.ResourceKey()] = true
-		}
-	}
-	
-	for _, key := range namespaceKeys {
-		// The check for existence of key is done above.
-		res := c.resources[key]
-		if visited[key] == 2 || !action(res, nsNodes) {
-			continue
-		}
-		visited[key] = 1
-		
-		// Mark this resource as visited if it has a cross-namespace parent
-		if crossNamespaceChildren[key] {
-			crossNamespaceVisited[key] = true
-		}
-		
-		if _, ok := graph[key]; ok {
-			for _, child := range graph[key] {
-				childKey := child.ResourceKey()
-				if visited[childKey] == 0 && action(child, nsNodes) {
-					// Mark child as visited if it has a cross-namespace parent
-					if crossNamespaceChildren[childKey] {
-						crossNamespaceVisited[childKey] = true
-					}
-					
-					child.iterateChildrenV2(graph, nsNodes, visited, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return false
-						}
-						// Track cross-namespace children during iteration
-						if crossNamespaceChildren[child.ResourceKey()] {
-							crossNamespaceVisited[child.ResourceKey()] = true
-						}
-						return action(child, namespaceResources)
-					})
-				}
-			}
-		}
-		visited[key] = 2
-	}
-}
-
-// processClusterNamespaceWithCrossRefs processes cluster-scoped namespace while avoiding duplicate visits to cross-namespace children
-func (c *clusterCache) processClusterNamespaceWithCrossRefs(clusterKeys []kube.ResourceKey, nsNodes map[kube.ResourceKey]*Resource, graph map[kube.ResourceKey]map[types.UID]*Resource, visited map[kube.ResourceKey]int, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool, crossNamespaceVisited map[kube.ResourceKey]bool) {
-	for _, key := range clusterKeys {
-		// The check for existence of key is done above.
-		res := c.resources[key]
-		if visited[key] == 2 || !action(res, nsNodes) {
-			continue
-		}
-		visited[key] = 1
-		if _, ok := graph[key]; ok {
-			for _, child := range graph[key] {
-				childKey := child.ResourceKey()
-				// Skip if this cross-namespace child was already visited
-				if crossNamespaceVisited[childKey] {
-					continue
-				}
-				if visited[childKey] == 0 && action(child, nsNodes) {
-					child.iterateChildrenV2(graph, nsNodes, visited, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return false
-						}
-						// Skip if this cross-namespace child was already visited
-						if crossNamespaceVisited[child.ResourceKey()] {
-							return false
-						}
-						return action(child, namespaceResources)
-					})
-				}
-			}
-		}
-		visited[key] = 2
-	}
-}
-
-// buildGraph builds a resource graph from the given nodes
-// When processingClusterNamespace is false, we're processing regular namespaces and will collect
-// missing owner references that need cluster-scoped parent resolution.
-// When processingClusterNamespace is true, we're processing the cluster-scoped namespace and will
-// resolve those previously collected references and build cross-namespace relationships.
-func buildGraph(nsNodes map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef, processingClusterNamespace bool) map[kube.ResourceKey]map[types.UID]*Resource {
-	// Fast path: if we're not collecting missing refs (feature disabled or in cluster namespace without refs),
-	// use the simpler original algorithm without any cross-namespace overhead
-	if missingRefs == nil || (processingClusterNamespace && (missingRefs == nil || len(*missingRefs) == 0)) {
-		return buildGraphSimple(nsNodes)
-	}
-	
-	// Slower path: handle cross-namespace references
-	return buildGraphWithCrossNamespace(nsNodes, missingRefs, processingClusterNamespace)
-}
-
-// buildGraphSimple is the original simple graph building algorithm without cross-namespace support
-// This is used when the feature is disabled or when there are no cross-namespace refs to process
+// buildGraphSimple builds graph without cross-namespace support (fastest path)
 func buildGraphSimple(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceKey]map[types.UID]*Resource {
-	// Prepare to construct a graph
 	nodesByUID := make(map[types.UID][]*Resource, len(nsNodes))
 	for _, node := range nsNodes {
 		nodesByUID[node.Ref.UID] = append(nodesByUID[node.Ref.UID], node)
 	}
 
-	// In graph, the key is the parent and the value is a list of children.
 	graph := make(map[kube.ResourceKey]map[types.UID]*Resource)
 
-	// Loop through all nodes, calling each one "childNode," because we're only bothering with it if it has a parent.
 	for _, childNode := range nsNodes {
 		for i, ownerRef := range childNode.OwnerRefs {
-			// First, backfill UID of inferred owner child references.
 			if ownerRef.UID == "" {
 				group, err := schema.ParseGroupVersion(ownerRef.APIVersion)
 				if err != nil {
-					// APIVersion is invalid, so we couldn't find the parent.
 					continue
 				}
 				graphKeyNode, ok := nsNodes[kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: childNode.Ref.Namespace, Name: ownerRef.Name}]
 				if !ok {
-					// No resource found with the given graph key, so move on.
 					continue
 				}
 				ownerRef.UID = graphKeyNode.Ref.UID
 				childNode.OwnerRefs[i] = ownerRef
 			}
 
-			// Now that we have the UID of the parent, update the graph.
 			uidNodes, ok := nodesByUID[ownerRef.UID]
 			if ok {
 				for _, uidNode := range uidNodes {
-					// Update the graph for this owner to include the child.
 					if _, ok := graph[uidNode.ResourceKey()]; !ok {
 						graph[uidNode.ResourceKey()] = make(map[types.UID]*Resource)
 					}
@@ -1330,8 +1188,6 @@ func buildGraphSimple(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceK
 					if !ok {
 						graph[uidNode.ResourceKey()][childNode.Ref.UID] = childNode
 					} else if r != nil {
-						// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group).
-						// It is ok to pick any object, but we need to make sure we pick the same child after every refresh.
 						key1 := r.ResourceKey()
 						key2 := childNode.ResourceKey()
 						if strings.Compare(key1.String(), key2.String()) > 0 {
@@ -1345,86 +1201,39 @@ func buildGraphSimple(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceK
 	return graph
 }
 
-// buildGraphWithCrossNamespace builds a graph with cross-namespace parent-child support
-func buildGraphWithCrossNamespace(nsNodes map[kube.ResourceKey]*Resource, missingRefs *[]missingOwnerRef, processingClusterNamespace bool) map[kube.ResourceKey]map[types.UID]*Resource {
-	// Prepare to construct a graph
+// buildGraphWithCrossNamespace builds graph with cross-namespace support
+func buildGraphWithCrossNamespace(nsNodes map[kube.ResourceKey]*Resource, clusterNodesByUID map[types.UID][]*Resource) map[kube.ResourceKey]map[types.UID]*Resource {
 	nodesByUID := make(map[types.UID][]*Resource, len(nsNodes))
-
 	for _, node := range nsNodes {
 		nodesByUID[node.Ref.UID] = append(nodesByUID[node.Ref.UID], node)
 	}
 
-	// Build index of missing refs by parent key for efficient lookup when processing cluster-scoped namespace
-	var missingRefsByParent map[kube.ResourceKey][]missingOwnerRef
-	if processingClusterNamespace && missingRefs != nil && len(*missingRefs) > 0 {
-		missingRefsByParent = make(map[kube.ResourceKey][]missingOwnerRef)
-		for _, ref := range *missingRefs {
-			missingRefsByParent[ref.parentKey] = append(missingRefsByParent[ref.parentKey], ref)
-		}
-	}
+	graph := make(map[kube.ResourceKey]map[types.UID]*Resource)
 
-
-	// In graph, the key is the parent and the value is a list of children.
-	// Pre-size to avoid rehashing during insertion
-	graph := make(map[kube.ResourceKey]map[types.UID]*Resource, len(nsNodes)/4)
-
-	// Process all nodes in the current namespace
 	for _, childNode := range nsNodes {
-		// If we're processing cluster-scoped namespace, check if this node has orphaned children
-		if processingClusterNamespace && missingRefsByParent != nil {
-			if orphanedChildren, exists := missingRefsByParent[childNode.ResourceKey()]; exists {
-				// This cluster-scoped resource has orphaned children - add them to the graph
-				for _, orphan := range orphanedChildren {
-					// Update the child's owner reference with the parent's UID
-					orphan.childResource.OwnerRefs[orphan.ownerRefIndex].UID = childNode.Ref.UID
-
-					// Add the cross-namespace relationship to the graph
-					if _, ok := graph[childNode.ResourceKey()]; !ok {
-						graph[childNode.ResourceKey()] = make(map[types.UID]*Resource)
-					}
-					graph[childNode.ResourceKey()][orphan.childResource.Ref.UID] = orphan.childResource
-				}
-			}
-		}
-
 		for i, ownerRef := range childNode.OwnerRefs {
-			// First, backfill UID of inferred owner child references.
 			if ownerRef.UID == "" {
 				group, err := schema.ParseGroupVersion(ownerRef.APIVersion)
 				if err != nil {
-					// APIVersion is invalid, so we couldn't find the parent.
 					continue
 				}
-				// Try same-namespace lookup first (preserves existing behavior)
-				sameNSKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: childNode.Ref.Namespace, Name: ownerRef.Name}
-				graphKeyNode, ok := nsNodes[sameNSKey]
-
-				if !ok && missingRefs != nil && !processingClusterNamespace {
-					// Parent not found in same namespace
-					clusterScopedKey := kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: "", Name: ownerRef.Name}
-					// We're in a regular namespace - collect missing reference for later resolution
-					*missingRefs = append(*missingRefs, missingOwnerRef{
-						childResource: childNode,
-						ownerRefIndex: i,
-						parentKey:     clusterScopedKey,
-					})
-					continue
+				// Try same-namespace lookup first (most common case)
+				graphKeyNode, ok := nsNodes[kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: childNode.Ref.Namespace, Name: ownerRef.Name}]
+				if ok {
+					ownerRef.UID = graphKeyNode.Ref.UID
+					childNode.OwnerRefs[i] = ownerRef
 				}
-
-				if !ok {
-					// No resource found with the given graph key, so move on.
-					continue
-				}
-				ownerRef.UID = graphKeyNode.Ref.UID
-				childNode.OwnerRefs[i] = ownerRef
+				// If not found in same namespace, UID remains empty and we'll check cluster-scoped below
 			}
 
-			// Now that we have the UID of the parent, update the graph.
+			// Check namespace-local parents first (most common case)
 			uidNodes, ok := nodesByUID[ownerRef.UID]
-
+			if !ok && ownerRef.UID != "" {
+				// Check cluster-scoped parents only if we have a UID
+				uidNodes, ok = clusterNodesByUID[ownerRef.UID]
+			}
 			if ok {
 				for _, uidNode := range uidNodes {
-					// Update the graph for this owner to include the child.
 					if _, ok := graph[uidNode.ResourceKey()]; !ok {
 						graph[uidNode.ResourceKey()] = make(map[types.UID]*Resource)
 					}
@@ -1432,8 +1241,6 @@ func buildGraphWithCrossNamespace(nsNodes map[kube.ResourceKey]*Resource, missin
 					if !ok {
 						graph[uidNode.ResourceKey()][childNode.Ref.UID] = childNode
 					} else if r != nil {
-						// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group).
-						// It is ok to pick any object, but we need to make sure we pick the same child after every refresh.
 						key1 := r.ResourceKey()
 						key2 := childNode.ResourceKey()
 						if strings.Compare(key1.String(), key2.String()) > 0 {
@@ -1444,7 +1251,6 @@ func buildGraphWithCrossNamespace(nsNodes map[kube.ResourceKey]*Resource, missin
 			}
 		}
 	}
-
 	return graph
 }
 
