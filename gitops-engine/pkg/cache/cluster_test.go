@@ -1390,7 +1390,7 @@ func BenchmarkBuildGraph(b *testing.B) {
 	testResources := buildTestResourceMap()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		buildGraphSimple(testResources)
+		buildGraph(testResources)
 	}
 }
 
