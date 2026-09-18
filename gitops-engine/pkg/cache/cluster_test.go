@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -2067,6 +2068,30 @@ func Test_watchEvents_Deadlock(t *testing.T) {
 			t.FailNow()
 		}
 	}
+}
+
+// TestStopWatching_RemovesNamespacedResourcesEntry verifies that tearing down
+// a GroupKind's watch also stops advertising it: a GK absent from apisMeta
+// must not linger in namespacedResources (IsNamespaced et al).
+func TestStopWatching_RemovesNamespacedResourcesEntry(t *testing.T) {
+	pod := testPod1()
+	gk := pod.GroupVersionKind().GroupKind()
+
+	cluster := newCluster(t, pod)
+	require.NoError(t, cluster.EnsureSynced())
+
+	cluster.lock.RLock()
+	_, watched := cluster.apisMeta[gk]
+	_, advertised := cluster.namespacedResources[gk]
+	cluster.lock.RUnlock()
+	require.True(t, watched, "sanity: pods are watched after sync")
+	require.True(t, advertised, "sanity: pods are advertised after sync")
+
+	cluster.stopWatching(gk, pod.Namespace)
+
+	_, err := cluster.IsNamespaced(gk)
+	require.Error(t, err, "stopWatching must stop advertising the GK's namespace scope")
+	assert.True(t, apierrors.IsNotFound(err), "IsNamespaced should report NotFound for a GK no longer watched")
 }
 
 func buildTestResourceMap() map[kube.ResourceKey]*Resource {

@@ -668,6 +668,9 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 	if info, ok := c.apisMeta[gk]; ok {
 		info.watchCancel()
 		delete(c.apisMeta, gk)
+		// Keep namespacedResources consistent with apisMeta: a GroupKind we no
+		// longer watch must not keep being advertised (IsNamespaced et al).
+		delete(c.namespacedResources, gk)
 		c.replaceResourceCache(gk, nil, ns)
 		c.log.Info(fmt.Sprintf("Stop watching: %s not found", gk))
 	}
