@@ -424,6 +424,123 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 	}
 }
 
+// TestRecordEvent_UnblocksParkedSenderOnInvalidate pins the batched-event
+// teardown contract: Invalidate cannot guarantee watch goroutines have stopped
+// (context cancellation does not unpark a goroutine blocked in a channel
+// send), so invalidateEventMeta retires the channel generation via eventsDone
+// instead of closing the channel under the parked sender, and never leaves
+// recordEvent sending on a nil channel afterwards.
+//
+// Pre-fix both halves failed: the first panicked with "send on closed channel"
+// (or timed out on a nil-channel send, depending on which side won the race),
+// and the second wedged forever sending on the nil channel.
+func TestRecordEvent_UnblocksParkedSenderOnInvalidate(t *testing.T) {
+	t.Parallel()
+	cluster := newClusterWithOptions(t, []UpdateSettingsFunc{SetBatchEventsProcessing(true)})
+	t.Cleanup(func() { cluster.Invalidate() })
+
+	pod := strToUnstructured(`
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: nginx
+    namespace: default
+    uid: "10"`)
+
+	// Install a channel generation with NO consumer, so the sender parks in
+	// the send exactly as it would when processEvents is busy elsewhere.
+	cluster.lock.Lock()
+	cluster.eventMetaCh = make(chan eventMeta)
+	cluster.eventsDone = make(chan struct{})
+	cluster.lock.Unlock()
+
+	unblocked := make(chan struct{})
+	go func() {
+		cluster.recordEvent(watch.Added, pod)
+		close(unblocked)
+	}()
+
+	// Best-effort nudge to let the goroutine reach the send before we
+	// invalidate. Not load-bearing: if it has not parked yet it observes the
+	// retired (nil) generation instead, which pre-fix wedged on a nil-channel
+	// send and post-fix returns immediately — so either interleaving is a
+	// valid regression test.
+	time.Sleep(50 * time.Millisecond)
+	cluster.lock.Lock()
+	cluster.invalidateEventMeta()
+	cluster.lock.Unlock()
+
+	select {
+	case <-unblocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordEvent sender still parked after invalidateEventMeta")
+	}
+
+	// After retirement there is no consumer generation; recordEvent must
+	// return immediately (dropping the event) rather than blocking forever on
+	// a nil channel.
+	done := make(chan struct{})
+	go func() {
+		cluster.recordEvent(watch.Added, pod)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordEvent blocked after the channel generation was retired")
+	}
+}
+
+// TestBatchedEvents_HalfInitializedGenerationDoesNotWedge covers the defensive
+// half of the eventMetaCh/eventsDone contract. The two fields always move as a
+// pair, so this state is not reachable through sync/invalidateEventMeta — but
+// the invariant is documented rather than enforced by the type, and the cost of
+// a future edit breaking it is precisely the permanent wedge this mechanism
+// exists to prevent: recordEvent would select a send against a nil done
+// channel, and processEvents would have no way to be told to stop. Both must
+// instead treat a nil eventsDone as a retired generation and bail.
+func TestBatchedEvents_HalfInitializedGenerationDoesNotWedge(t *testing.T) {
+	t.Parallel()
+	cluster := newClusterWithOptions(t, []UpdateSettingsFunc{SetBatchEventsProcessing(true)})
+	t.Cleanup(func() { cluster.Invalidate() })
+
+	pod := strToUnstructured(`
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: nginx
+    namespace: default
+    uid: "10"`)
+
+	// Half-initialized generation: a live channel with no retirement signal.
+	cluster.lock.Lock()
+	cluster.eventMetaCh = make(chan eventMeta)
+	cluster.eventsDone = nil
+	cluster.lock.Unlock()
+
+	recorded := make(chan struct{})
+	go func() {
+		cluster.recordEvent(watch.Added, pod)
+		close(recorded)
+	}()
+	select {
+	case <-recorded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recordEvent wedged on a generation with a nil eventsDone")
+	}
+
+	processed := make(chan struct{})
+	go func() {
+		cluster.processEvents()
+		close(processed)
+	}()
+	select {
+	case <-processed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processEvents never returned for a generation with a nil eventsDone")
+	}
+}
+
 // TestStatefulSetPVC_ParentToChildrenIndex verifies that inferred StatefulSet → PVC
 // relationships are correctly captured in the parentUIDToChildren index during initial sync.
 //

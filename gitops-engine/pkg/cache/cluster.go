@@ -235,9 +235,32 @@ type clusterCache struct {
 
 	apisMeta              map[schema.GroupKind]*apiMeta
 	batchEventsProcessing bool
-	eventMetaCh           chan eventMeta
-	serverVersion         string
-	apiResources          []kube.APIResourceInfo
+	// eventMetaCh carries watch events to the batching goroutine when
+	// batchEventsProcessing is set. Created in sync, drained by processEvents.
+	// nil when batching is off, and between invalidateEventMeta and the next
+	// sync.
+	//
+	// The channel itself is never closed: producers (recordEvent, called from
+	// watch goroutines) send without holding c.lock, and Invalidate cannot
+	// guarantee they have stopped — context cancellation does not unpark a
+	// goroutine already blocked in a channel send, so a close would panic it.
+	// Instead invalidateEventMeta closes eventsDone; both producers and the
+	// consumer select on it and bail, and the channel is left for the GC.
+	eventMetaCh chan eventMeta
+	// eventsDone signals retirement of the current eventMetaCh generation.
+	// Created together with eventMetaCh in sync, closed by invalidateEventMeta.
+	// Both fields are written under c.lock and read under it (or its RLock).
+	//
+	// The two fields always move as a pair, so eventMetaCh != nil implies
+	// eventsDone != nil. Readers nonetheless treat a nil eventsDone as a
+	// retired generation: selecting a send against a nil done channel would
+	// block forever, which is the exact wedge this whole mechanism exists to
+	// prevent. Enforcing the invariant defensively means a future edit that
+	// touches one field without the other degrades to a dropped event rather
+	// than a hung watch goroutine.
+	eventsDone    chan struct{}
+	serverVersion string
+	apiResources  []kube.APIResourceInfo
 	// namespacedResources is a simple map which indicates a groupKind is namespaced
 	namespacedResources map[schema.GroupKind]bool
 
@@ -1147,6 +1170,7 @@ func (c *clusterCache) sync() (err error) {
 	if c.batchEventsProcessing {
 		c.invalidateEventMeta()
 		c.eventMetaCh = make(chan eventMeta)
+		c.eventsDone = make(chan struct{})
 	}
 
 	syncLock.Lock()
@@ -1257,10 +1281,14 @@ func (c *clusterCache) sync() (err error) {
 	return nil
 }
 
-// invalidateEventMeta closes the eventMeta channel if it is open
+// invalidateEventMeta retires the current eventMeta channel generation.
+// Closing eventsDone (never eventMetaCh itself) unparks any producer blocked
+// mid-send and stops the processEvents consumer; see the eventMetaCh field
+// docs on clusterCache. Caller holds c.lock.
 func (c *clusterCache) invalidateEventMeta() {
-	if c.eventMetaCh != nil {
-		close(c.eventMetaCh)
+	if c.eventsDone != nil {
+		close(c.eventsDone)
+		c.eventsDone = nil
 		c.eventMetaCh = nil
 	}
 }
@@ -1696,7 +1724,27 @@ func (c *clusterCache) recordEvent(event watch.EventType, un *unstructured.Unstr
 	}
 
 	if c.batchEventsProcessing {
-		c.eventMetaCh <- eventMeta{event, un}
+		// Snapshot the current channel generation under the lock, then send
+		// WITHOUT it (the consumer takes c.lock to process a batch, so holding
+		// it across the send would deadlock). Selecting on eventsDone keeps a
+		// parked sender safe against Invalidate: cancellation cannot unpark a
+		// blocked send, so invalidateEventMeta closes eventsDone rather than
+		// the channel we are sending on.
+		c.lock.RLock()
+		ch, done := c.eventMetaCh, c.eventsDone
+		c.lock.RUnlock()
+		if ch == nil || done == nil {
+			// Between invalidateEventMeta and the next sync there is no
+			// consumer; drop the event — the upcoming full re-sync rebuilds
+			// state from a fresh list anyway. A nil done channel counts as
+			// retired for the same reason: selecting the send against it
+			// would park this watch goroutine forever.
+			return
+		}
+		select {
+		case ch <- eventMeta{event, un}:
+		case <-done:
+		}
 	} else {
 		c.lock.Lock()
 		defer c.lock.Unlock()
@@ -1709,8 +1757,15 @@ func (c *clusterCache) processEvents() {
 	log.V(1).Info("Start processing events")
 
 	c.lock.Lock()
-	ch := c.eventMetaCh
+	ch, done := c.eventMetaCh, c.eventsDone
 	c.lock.Unlock()
+	if ch == nil || done == nil {
+		// Our channel generation was retired before we could start (an
+		// Invalidate raced the goroutine spawn). Nothing to consume. A nil
+		// done channel counts as retired too: without it this loop could
+		// never be told to stop.
+		return
+	}
 
 	eventMetas := make([]eventMeta, 0)
 	ticker := time.NewTicker(c.eventProcessingInterval)
@@ -1718,12 +1773,11 @@ func (c *clusterCache) processEvents() {
 
 	for {
 		select {
-		case evMeta, ok := <-ch:
-			if !ok {
-				log.V(2).Info("Event processing channel closed, finish processing")
-				return
-			}
+		case evMeta := <-ch:
 			eventMetas = append(eventMetas, evMeta)
+		case <-done:
+			log.V(2).Info("Event processing channel retired, finish processing")
+			return
 		case <-ticker.C:
 			if len(eventMetas) > 0 {
 				c.processEventsBatch(eventMetas)
