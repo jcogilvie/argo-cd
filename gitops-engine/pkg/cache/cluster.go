@@ -637,9 +637,11 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 		opts[i](c)
 	}
 
-	if c.batchEventsProcessing {
-		c.invalidateEventMeta()
-	}
+	// invalidateEventMeta is nil-safe, so it is called unconditionally here:
+	// guarding on batchEventsProcessing would leak the processing goroutine
+	// and its channel if that setting is toggled off (via an opt) in this
+	// same Invalidate call.
+	c.invalidateEventMeta()
 	c.apisMeta = nil
 	c.namespacedResources = nil
 	c.log.Info("Invalidated cluster")

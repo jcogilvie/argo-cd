@@ -2989,3 +2989,31 @@ func TestAPIResourceLabelSelectorIsAppliedToList(t *testing.T) {
 	assert.Len(t, resources, 1)
 	assert.Contains(t, resources, kube.NewResourceKey("", "Pod", "default", "matching"))
 }
+
+// TestInvalidate_DisablingBatchProcessingRetiresEventMeta reproduces a goroutine/channel
+// leak: Invalidate applied the caller's opts *before* deciding whether to retire the
+// batched-event machinery, so Invalidate(SetBatchEventsProcessing(false)) read the
+// already-updated (false) setting and skipped invalidateEventMeta entirely, leaving the
+// processEvents goroutine and its channel from the previous sync() running forever.
+func TestInvalidate_DisablingBatchProcessingRetiresEventMeta(t *testing.T) {
+	t.Parallel()
+
+	var opts []UpdateSettingsFunc
+	opts = append(opts, func(c *clusterCache) {
+		c.batchEventsProcessing = true
+		c.eventProcessingInterval = 1 * time.Millisecond
+	})
+
+	cluster := newClusterWithOptions(t, opts)
+	require.NoError(t, cluster.EnsureSynced())
+
+	cluster.lock.Lock()
+	require.NotNil(t, cluster.eventMetaCh, "sync() should have started the batched-event channel")
+	cluster.lock.Unlock()
+
+	cluster.Invalidate(SetBatchEventsProcessing(false))
+
+	cluster.lock.Lock()
+	defer cluster.lock.Unlock()
+	assert.Nil(t, cluster.eventMetaCh, "Invalidate(SetBatchEventsProcessing(false)) must retire the batched-event channel, not just the setting")
+}
