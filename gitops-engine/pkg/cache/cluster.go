@@ -437,6 +437,40 @@ func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
 	}
 }
 
+// crdVersionsToAPIResources decodes an unstructured CRD event object and
+// expands its spec.versions into one kube.APIResourceInfo per served
+// version. It returns early with a nil slice and a non-nil error if the CRD
+// cannot be decoded, so callers never derive resources from a partially
+// populated struct.
+func (c *clusterCache) crdVersionsToAPIResources(obj *unstructured.Unstructured) ([]kube.APIResourceInfo, error) {
+	crd := apiextensionsv1.CustomResourceDefinition{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &crd); err != nil {
+		return nil, fmt.Errorf("failed to extract CRD from unstructured: %w", err)
+	}
+	resources := make([]kube.APIResourceInfo, 0, len(crd.Spec.Versions))
+	for _, v := range crd.Spec.Versions {
+		resources = append(resources, kube.APIResourceInfo{
+			GroupKind: schema.GroupKind{
+				Group: crd.Spec.Group, Kind: crd.Spec.Names.Kind,
+			},
+			GroupVersionResource: schema.GroupVersionResource{
+				Group: crd.Spec.Group, Version: v.Name, Resource: crd.Spec.Names.Plural,
+			},
+			Meta: metav1.APIResource{
+				Group:        crd.Spec.Group,
+				SingularName: crd.Spec.Names.Singular,
+				Namespaced:   crd.Spec.Scope == apiextensionsv1.NamespaceScoped,
+				Name:         crd.Spec.Names.Plural,
+				Kind:         crd.Spec.Names.Singular,
+				Version:      v.Name,
+				ShortNames:   crd.Spec.Names.ShortNames,
+			},
+			LabelSelector: c.settings.ResourcesFilter.GetLabelSelector(crd.Spec.Group, crd.Spec.Names.Kind, c.config.Host),
+		})
+	}
+	return resources, nil
+}
+
 func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Resource, ns string) {
 	objByKey := make(map[kube.ResourceKey]*Resource)
 	for i := range resources {
@@ -881,31 +915,21 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 
 				c.recordEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
-					var resources []kube.APIResourceInfo
-					crd := apiextensionsv1.CustomResourceDefinition{}
-					err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &crd)
+					resources, err := c.crdVersionsToAPIResources(obj)
 					if err != nil {
 						c.log.Error(err, "Failed to extract CRD resources")
 					}
-					for _, v := range crd.Spec.Versions {
-						resources = append(resources, kube.APIResourceInfo{
-							GroupKind: schema.GroupKind{
-								Group: crd.Spec.Group, Kind: crd.Spec.Names.Kind,
-							},
-							GroupVersionResource: schema.GroupVersionResource{
-								Group: crd.Spec.Group, Version: v.Name, Resource: crd.Spec.Names.Plural,
-							},
-							Meta: metav1.APIResource{
-								Group:        crd.Spec.Group,
-								SingularName: crd.Spec.Names.Singular,
-								Namespaced:   crd.Spec.Scope == apiextensionsv1.NamespaceScoped,
-								Name:         crd.Spec.Names.Plural,
-								Kind:         crd.Spec.Names.Singular,
-								Version:      v.Name,
-								ShortNames:   crd.Spec.Names.ShortNames,
-							},
-							LabelSelector: c.settings.ResourcesFilter.GetLabelSelector(crd.Spec.Group, crd.Spec.Names.Kind, c.config.Host),
-						})
+
+					// Identify the CRD by the GroupKind of the resource it defines
+					// (e.g. "CronTab.stable.example.com"), not by the
+					// apiextensions.k8s.io/CustomResourceDefinition wrapper kind,
+					// which is identical for every CRD event on every cluster and
+					// tells an operator nothing about which CRD changed. Fall back
+					// to the CRD object's own name when decoding failed and no
+					// versions could be extracted.
+					innerGroupKind := obj.GetName()
+					if len(resources) > 0 {
+						innerGroupKind = resources[0].GroupKind.String()
 					}
 
 					if event.Type == watch.Deleted {
@@ -913,7 +937,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 							c.deleteAPIResource(resources[i])
 						}
 					} else {
-						c.log.Info("Updating Kubernetes APIs, watches, and Open API schemas due to CRD event", "eventType", event.Type, "groupKind", crd.GroupVersionKind().GroupKind().String())
+						c.log.Info("Updating Kubernetes APIs, watches, and Open API schemas due to CRD event", "eventType", event.Type, "groupKind", innerGroupKind)
 						// add new CRD's groupkind to c.apigroups
 						if event.Type == watch.Added {
 							for i := range resources {

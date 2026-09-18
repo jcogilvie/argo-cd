@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"golang.org/x/sync/semaphore"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -26,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -38,6 +42,14 @@ import (
 
 func init() {
 	err := apiextensions.AddToScheme(scheme.Scheme)
+	if err != nil {
+		panic(err)
+	}
+	// Registers apiextensions.k8s.io/v1 (the internal apiextensions.AddToScheme
+	// above only registers the unversioned/internal group version), so the
+	// fake dynamic client can List/Watch CustomResourceDefinitionList by its
+	// real, served GVR in tests that drive CRD watch events end-to-end.
+	err = apiextensionsv1.AddToScheme(scheme.Scheme)
 	if err != nil {
 		panic(err)
 	}
@@ -2988,4 +3000,211 @@ func TestAPIResourceLabelSelectorIsAppliedToList(t *testing.T) {
 	})
 	assert.Len(t, resources, 1)
 	assert.Contains(t, resources, kube.NewResourceKey("", "Pod", "default", "matching"))
+}
+
+// --- CRD watch-event logging and decode-failure tests ---
+//
+// There is no extracted per-event handler for CRD events on master (see the
+// TODO on Test_watchEvents_Deadlock: "how to simulate real watch events and
+// test the full watchEvents function?"), so these tests drive real
+// watch.Added events through the actual clusterCache.watchEvents loop via
+// the fake dynamic client's watch machinery, rather than asserting against
+// an internal that would have to be exported or extracted just for testing.
+
+// crdWatchAPIResource describes the (cluster-scoped) apiextensions.k8s.io/v1
+// CustomResourceDefinition resource that clusterCache.watchEvents watches to
+// learn about new/changed/removed CRDs.
+func crdWatchAPIResource() kube.APIResourceInfo {
+	return kube.APIResourceInfo{
+		GroupKind:            schema.GroupKind{Group: "apiextensions.k8s.io", Kind: "CustomResourceDefinition"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"},
+		Meta:                 metav1.APIResource{Namespaced: false},
+	}
+}
+
+// newCRDEventLogger installs a funcr-based logr.Logger on cluster that
+// appends every log call to a thread-safe buffer, and returns a snapshot
+// function to read it back. funcr is part of the go-logr/logr module that
+// the package already depends on for its "log logr.Logger" field.
+func newCRDEventLogger(cluster *clusterCache) (snapshot func() string) {
+	var (
+		mu  sync.Mutex
+		buf strings.Builder
+	)
+	cluster.log = funcr.New(func(prefix, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		buf.WriteString(prefix)
+		buf.WriteString(" ")
+		buf.WriteString(args)
+		buf.WriteString("\n")
+	}, funcr.Options{Verbosity: 1})
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+// crdEventLogLine returns the line(s) of a captured log buffer that carry
+// the "Updating Kubernetes APIs..." message emitted for a CRD Added/Modified
+// event, filtering out unrelated noise -- notably kube.RetryUntilSucceed's
+// own "Start watch CustomResourceDefinition.apiextensions.k8s.io on ..."
+// bookkeeping line, which always mentions the apiextensions wrapper kind
+// (since that's the resource type being watched) and would otherwise make a
+// blanket NotContains assertion on the whole buffer spuriously fail.
+func crdEventLogLine(log string) string {
+	var matched []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, "Updating Kubernetes APIs, watches, and Open API schemas due to CRD event") {
+			matched = append(matched, line)
+		}
+	}
+	return strings.Join(matched, "\n")
+}
+
+// startCRDWatch starts clusterCache.watchEvents for the CRD GVR against the
+// cluster's fake dynamic client and returns a resource client that tests can
+// use to fire Added/Modified/Deleted events, plus a cancel func to stop the
+// watch goroutine at the end of the test.
+func startCRDWatch(t *testing.T, cluster *clusterCache) (resClient dynamic.ResourceInterface, cancel func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	dynamicClient := cluster.kubectl.(*kubetest.MockKubectlCmd).DynamicClient
+	resClient = dynamicClient.Resource(crdWatchAPIResource().GroupVersionResource)
+	go cluster.watchEvents(ctx, crdWatchAPIResource(), resClient, "", "")
+	return resClient, cancel
+}
+
+func TestWatchEvents_CRDEvent_LogsInnerGroupKind(t *testing.T) {
+	cluster := newCluster(t, testCRD())
+	getLog := newCRDEventLogger(cluster)
+	resClient, cancel := startCRDWatch(t, cluster)
+	defer cancel()
+
+	// Keep creating a fresh, uniquely named, well-formed CRD until one lands
+	// after the watch has actually become live (the watch's own startup,
+	// including its initial list, races with these Create calls, and a
+	// Create issued before the watch registers is simply never delivered as
+	// an event to it).
+	attempt := 0
+	require.Eventually(t, func() bool {
+		attempt++
+		crd := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata": map[string]any{
+				"name":            fmt.Sprintf("dummies-%d.example.com", attempt),
+				"resourceVersion": fmt.Sprintf("%d", attempt),
+			},
+			"spec": map[string]any{
+				"group": "example.com",
+				"names": map[string]any{"kind": "Dummy", "plural": "dummies", "singular": "dummy"},
+				"scope": "Namespaced",
+				"versions": []any{
+					map[string]any{"name": "v1", "served": true, "storage": true},
+				},
+			},
+		}}
+		_, _ = resClient.Create(context.Background(), crd, metav1.CreateOptions{})
+		return strings.Contains(getLog(), "Dummy.example.com")
+	}, 2*time.Second, 20*time.Millisecond, "expected the CRD watch event to log the inner CRD GroupKind")
+
+	logged := crdEventLogLine(getLog())
+	require.NotEmpty(t, logged, "expected an \"Updating Kubernetes APIs...\" log line for the CRD event")
+	assert.Contains(t, logged, `"groupKind"="Dummy.example.com"`,
+		"log line should carry the inner CRD GroupKind, not the apiextensions wrapper. got: %s", logged)
+	assert.NotContains(t, logged, "CustomResourceDefinition.apiextensions.k8s.io",
+		"log line should not identify the apiextensions.k8s.io/CustomResourceDefinition wrapper kind. got: %s", logged)
+}
+
+func TestWatchEvents_CRDEvent_LogsCRDNameOnDecodeFailure(t *testing.T) {
+	cluster := newCluster(t, testCRD())
+	getLog := newCRDEventLogger(cluster)
+	resClient, cancel := startCRDWatch(t, cluster)
+	defer cancel()
+
+	// spec.versions is the wrong type, so
+	// runtime.DefaultUnstructuredConverter.FromUnstructured fails to decode
+	// it at all and crdVersionsToAPIResources returns no resources -- there
+	// is no inner GroupKind to report, so the log must fall back to the
+	// CRD object's own metadata.name.
+	attempt := 0
+	require.Eventually(t, func() bool {
+		attempt++
+		name := fmt.Sprintf("broken-%d.example.com", attempt)
+		crd := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata": map[string]any{
+				"name":            name,
+				"resourceVersion": fmt.Sprintf("%d", attempt),
+			},
+			"spec": map[string]any{
+				"group":    "example.com",
+				"versions": "not-a-list",
+			},
+		}}
+		_, _ = resClient.Create(context.Background(), crd, metav1.CreateOptions{})
+		// Check for the shared "broken-" prefix, not this attempt's own
+		// name: an earlier attempt's Create may only be delivered and
+		// logged after this attempt's check already ran, since delivery is
+		// asynchronous relative to Create returning.
+		return strings.Contains(getLog(), "broken-")
+	}, 2*time.Second, 20*time.Millisecond, "expected the CRD watch event to fall back to the CRD's metadata.name")
+
+	logged := crdEventLogLine(getLog())
+	require.NotEmpty(t, logged, "expected an \"Updating Kubernetes APIs...\" log line for the CRD event")
+	assert.Contains(t, logged, "broken-",
+		"on decode failure the log should identify the CRD by metadata.name. got: %s", logged)
+	assert.NotContains(t, logged, "CustomResourceDefinition.apiextensions.k8s.io",
+		"log line should not identify the apiextensions.k8s.io/CustomResourceDefinition wrapper kind. got: %s", logged)
+}
+
+func TestWatchEvents_CRDEvent_DecodeFailureDoesNotMutateAPIResources(t *testing.T) {
+	cluster := newCluster(t, testCRD())
+	getLog := newCRDEventLogger(cluster)
+	resClient, cancel := startCRDWatch(t, cluster)
+	defer cancel()
+
+	before := append([]kube.APIResourceInfo(nil), cluster.GetAPIResources()...)
+
+	// spec.versions decodes successfully, but preserveUnknownFields (which
+	// is declared after Versions in CustomResourceDefinitionSpec, so the
+	// reflect-based FromUnstructured converter reaches it only after
+	// Versions has already been populated) has the wrong type. This makes
+	// FromUnstructured return an error over an otherwise fully-decoded
+	// struct -- the scenario pre-fix code mishandles by still building
+	// resources from crd.Spec.Versions and feeding them into
+	// appendAPIResource.
+	attempt := 0
+	require.Eventually(t, func() bool {
+		attempt++
+		crd := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata": map[string]any{
+				"name":            fmt.Sprintf("widgets-%d.example.com", attempt),
+				"resourceVersion": fmt.Sprintf("%d", attempt),
+			},
+			"spec": map[string]any{
+				"group": "example.com",
+				"names": map[string]any{"kind": "Widget", "plural": "widgets", "singular": "widget"},
+				"scope": "Namespaced",
+				"versions": []any{
+					map[string]any{"name": "v1", "served": true, "storage": true},
+				},
+				"preserveUnknownFields": "not-a-bool",
+			},
+		}}
+		_, _ = resClient.Create(context.Background(), crd, metav1.CreateOptions{})
+		return strings.Contains(getLog(), "Updating Kubernetes APIs, watches, and Open API schemas due to CRD event")
+	}, 2*time.Second, 20*time.Millisecond, "expected the malformed CRD event to be processed")
+
+	cluster.lock.Lock()
+	after := append([]kube.APIResourceInfo(nil), cluster.apiResources...)
+	cluster.lock.Unlock()
+
+	assert.Equal(t, before, after, "a CRD decode failure must not mutate the cache's advertised API resources")
 }
