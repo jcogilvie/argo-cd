@@ -2069,6 +2069,30 @@ func Test_watchEvents_Deadlock(t *testing.T) {
 	}
 }
 
+// TestStartMissingWatches_LazyInitsApisMetaAfterInvalidate covers a window
+// where apisMeta is nil between Invalidate and the next sync, and
+// handleCRDEvent can fire from a still-draining pre-Invalidate watch
+// goroutine and route through startMissingWatches in that window. Pre-fix
+// this panicked with "assignment to entry in nil map" (recovered into
+// watch-retry noise, CRD event lost).
+func TestStartMissingWatches_LazyInitsApisMetaAfterInvalidate(t *testing.T) {
+	cluster := newCluster(t)
+
+	// Reproduce post-Invalidate state: apisMeta is nil while sync has not yet
+	// rebuilt it. startMissingWatches' contract is "caller holds cluster.lock".
+	require.NotPanics(t, func() {
+		cluster.lock.Lock()
+		defer cluster.lock.Unlock()
+		cluster.apisMeta = nil
+		require.NoError(t, cluster.startMissingWatches())
+	})
+
+	cluster.lock.RLock()
+	defer cluster.lock.RUnlock()
+	require.NotNil(t, cluster.apisMeta, "startMissingWatches should lazy-init apisMeta")
+	assert.NotEmpty(t, cluster.apisMeta, "the discovered GroupKinds should now be watched")
+}
+
 func buildTestResourceMap() map[kube.ResourceKey]*Resource {
 	ns := make(map[kube.ResourceKey]*Resource)
 	for i := range 100000 {

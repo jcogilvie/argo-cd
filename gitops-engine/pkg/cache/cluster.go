@@ -687,6 +687,13 @@ func (c *clusterCache) startMissingWatches() error {
 	if err != nil {
 		return fmt.Errorf("failed to create clientset: %w", err)
 	}
+	// apisMeta is nil between Invalidate and the next sync — this path can run
+	// in that window when handleCRDEvent fires from a still-draining
+	// pre-Invalidate watch goroutine. Lazy-init instead of panicking on the
+	// nil-map write below.
+	if c.apisMeta == nil {
+		c.apisMeta = make(map[schema.GroupKind]*apiMeta)
+	}
 	namespacedResources := make(map[schema.GroupKind]bool)
 	for i := range apis {
 		api := apis[i]
